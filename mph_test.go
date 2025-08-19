@@ -63,7 +63,7 @@ func testMPHU64(t *testing.T, keys []uint64) {
 		t.Fatal(err)
 	}
 	for i, k := range keys {
-		if got := tab.Query(k); got != int32(i) {
+		if got := tab.QueryUint64(k); got != int32(i) {
 			t.Errorf("Lookup(%v)=%v, want %v", k, got, i)
 		}
 	}
@@ -96,8 +96,8 @@ func TestMPH_Determinism(t *testing.T) {
 		t.Fatal(err)
 	}
 	for i, k := range keys {
-		g1 := tab1.Query(k)
-		g2 := tab2.Query(k)
+		g1 := tab1.QueryUint64(k)
+		g2 := tab2.QueryUint64(k)
 		if g1 != g2 || g1 != int32(i) {
 			t.Fatalf("determinism failure: key[%d]=%v -> (%d,%d), want %d", i, k, g1, g2, i)
 		}
@@ -138,7 +138,7 @@ func BenchmarkMPH_U64(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		for _, k := range keys {
-			sinkI32 += tab.Query(k)
+			sinkI32 += tab.QueryUint64(k)
 		}
 	}
 }

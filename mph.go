@@ -154,7 +154,11 @@ func NewUint64(keys []uint64) (*Table, error) {
 	}, nil
 }
 
-func (t *Table) Query(hash uint64) int32 {
+func (t *Table) Query(k string) int32 {
+	return t.QueryUint64(xxhash.Sum64String(k))
+}
+
+func (t *Table) QueryUint64(hash uint64) int32 {
 	if len(t.Values) == 0 {
 		return -1
 	}
