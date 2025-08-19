@@ -2,139 +2,192 @@
 package mph
 
 import (
+	"errors"
+	"fmt"
 	"sort"
 
-	"github.com/dgryski/go-metro"
+	"github.com/cespare/xxhash/v2"
 )
 
-// Table stores the values for the hash function
+var (
+	ErrCouldNotBuildTable = errors.New("could not build table")
+)
+
+// Table stores the arrays that represent the hash function.
+// - Values: final ordinal (index)
+// - Seeds:  route to value, this was part of a multi key bucket input
+//   - high bit set = singleton value, there is no contention for allocation
+//   - high bit clear = multi-key bucket, the seed is the displacement of the initial value retrieved
 type Table struct {
 	Values []int32
-	Seeds  []int32
+	Seeds  []uint32
+	Mask   uint64
 }
+
+const (
+	singletonBit = uint32(1 << 31)
+	payloadMask  = ^singletonBit
+)
 
 type entry struct {
 	idx  int32
 	hash uint64
 }
 
-// New constructs a minimal perfect hash function for the set of keys which returns the index of item in the keys array.
-func New(keys []string) *Table {
-	size := uint64(nextPower2(len(keys)))
+func New(keys []string) (*Table, error) {
+	hKeys := make([]uint64, len(keys))
+	for i, k := range keys {
+		hKeys[i] = xxhash.Sum64String(k)
+	}
 
-	h := make([][]entry, size)
+	return NewUint64(hKeys)
+}
+
+func NewUint64(keys []uint64) (*Table, error) {
+	if len(keys) == 0 {
+		return &Table{}, nil
+	}
+
+	if len(keys) > (1 << 31) {
+		return nil, fmt.Errorf("%w: too many keys, 2^31 is the max", ErrCouldNotBuildTable)
+	}
+
+	// early dedupe/error on duplicate hash
+	tmp := append([]uint64(nil), keys...)
+	sort.Slice(tmp, func(i, j int) bool { return tmp[i] < tmp[j] })
+	for i := 1; i < len(tmp); i++ {
+		if tmp[i] == tmp[i-1] {
+			return nil, fmt.Errorf("%w: duplicate 64-bit hash %d", ErrCouldNotBuildTable, tmp[i])
+		}
+	}
+
+	size := uint64(nextPower2(len(keys)))
+	mask := size - 1
+	h := make([][]entry, int(size))
+	values := make([]int32, int(size))
+	seeds := make([]uint32, int(size))
+
 	for idx, k := range keys {
-		hash := metro.Hash64Str(k, 0)
-		i := hash % size
-		// idx+1 so we can identify empty entries in the table with 0
+		hash := k
+		// extract the lower log2 size bits
+		i := int(hash & mask)
+		// 0 means empty, that is why idx+1 is used
 		h[i] = append(h[i], entry{int32(idx) + 1, hash})
 	}
 
+	// pick the biggest buckets first - handle the most difficult before moving on to the simpler
 	sort.Slice(h, func(i, j int) bool { return len(h[i]) > len(h[j]) })
-
-	values := make([]int32, size)
-	seeds := make([]int32, size)
 
 	var hidx int
 	for hidx = 0; hidx < len(h) && len(h[hidx]) > 1; hidx++ {
 		subkeys := h[hidx]
 
 		var seed uint64
-		entries := make(map[uint64]int32)
+		entries := make(map[uint64]int32, len(subkeys))
 
 	newseed:
 		for {
 			seed++
+			// we use the first bit for singletons
+			if seed >= (1 << 31) {
+				return nil, fmt.Errorf("%w: no seed < 2^31", ErrCouldNotBuildTable)
+			}
+
 			for _, k := range subkeys {
-				i := xorshiftMult64(k.hash+seed) % size
-				if entries[i] == 0 && values[i] == 0 {
-					// looks free, claim it
+				i := xorshiftMult64(k.hash+seed) & mask
+
+				// check if slot i is free in both temporary (entries) and permanent (values)
+				if entries[i] == 0 && values[int(i)] == 0 {
 					entries[i] = k.idx
 					continue
 				}
 
-				// found a collision, reset and try a new seed
+				// hash collision, clear scratch claims and try next seed
 				for k := range entries {
 					delete(entries, k)
 				}
 				continue newseed
 			}
 
-			// made it through; everything got placed
 			break
 		}
 
-		// mark subkey spaces as claimed ...
+		// commit placements: mark these slots as permanently taken.
 		for k, v := range entries {
-			values[k] = v
+			values[int(k)] = v
 		}
 
-		// ... and assign this seed value for every subkey
-		// NOTE(dgryski): While k.hash is different for each entry, i = k.hash % size is the same.
-		// We don't need to loop over the entire slice, we can just take the seed from the first entry.
-
-		i := subkeys[0].hash % size
-		seeds[i] = int32(seed)
+		// store this seed for the entire bucket
+		i := subkeys[0].hash & mask
+		seeds[int(i)] = uint32(seed) // fits in 31 bits
 	}
 
-	// find the unassigned entries in the table
-	var free []int
+	// these are all singletons - entries with no conflicts in their respective buckets
+	// collect free values
+	free := make([]int, 0, int(size))
 	for i := range values {
 		if values[i] == 0 {
 			free = append(free, i)
 		} else {
-			// decrement idx as this is now the final value for the table
+			// stored idx+1 before
 			values[i]--
 		}
 	}
 
-	for hidx < len(h) && len(h[hidx]) > 0 {
-		k := h[hidx][0]
-		i := k.hash % size
-		hidx++
+	for ; hidx < len(h) && len(h[int(hidx)]) > 0; hidx++ {
+		k := h[int(hidx)][0]
+		i := k.hash & mask
 
-		// take a free slot
 		dst := free[0]
 		free = free[1:]
 
-		// claim it; -1 because of the +1 at the start
 		values[dst] = k.idx - 1
 
-		// store offset in seed as a negative; -1 so even slot 0 is negative
-		seeds[i] = -int32(dst + 1)
+		// high bit = 1 (marked as singleton, no seed logic required to get to value), payload = dst.
+		seeds[int(i)] = singletonBit | uint32(dst)
 	}
 
 	return &Table{
 		Values: values,
 		Seeds:  seeds,
-	}
+		Mask:   mask,
+	}, nil
 }
 
-// Query looks up an entry in the table and return the index.
-func (t *Table) Query(k string) int32 {
-	size := uint64(len(t.Values))
-	hash := metro.Hash64Str(k, 0)
-	i := hash & (size - 1)
-	seed := t.Seeds[i]
-	if seed < 0 {
-		return t.Values[-seed-1]
+func (t *Table) Query(hash uint64) int32 {
+	if len(t.Values) == 0 {
+		return -1
 	}
 
-	i = xorshiftMult64(uint64(seed)+hash) & (size - 1)
-	return t.Values[i]
+	i := int(hash & t.Mask)
+	s := t.Seeds[i]
+
+	// `if seed < 0` is bugged
+	// there are edge cases where the value returned by doing `[-seed-1]` will return an index that is out of bounds
+	if s&singletonBit != 0 {
+		// singleton case, this is easy, just get everything except for the highest bit
+		dst := int(s & payloadMask)
+		return t.Values[dst]
+	}
+
+	// multi key case recompute displaced slot with xorshiftMult64(hash+seed) & mask
+	seed := uint64(s & payloadMask)
+	j := xorshiftMult64(hash+seed) & t.Mask
+	return t.Values[int(j)]
 }
 
 func xorshiftMult64(x uint64) uint64 {
-	x ^= x >> 12 // a
-	x ^= x << 25 // b
-	x ^= x >> 27 // c
+	x ^= x >> 12
+	x ^= x << 25
+	x ^= x >> 27
 	return x * 2685821657736338717
 }
 
+// nextPower2 returns the smallest power of two >= n.
 func nextPower2(n int) int {
 	i := 1
 	for i < n {
-		i *= 2
+		i <<= 1
 	}
 	return i
 }
